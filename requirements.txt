@@ -1,0 +1,5 @@
+pycryptodome
+mutagen
+python-telegram-bot[job-queue]
+spotdl
+yt-dlp
