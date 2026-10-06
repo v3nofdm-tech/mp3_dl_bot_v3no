@@ -107,7 +107,7 @@ class DeezerSession:
             "/", True, True, None, True, None, None, {}, False,
         ))
 
-    def _gw(self, method: str, params: dict = None) -> dict:
+    def _gw(self, method: str, params: dict = None, retry=True) -> dict:
         url  = f"{_GW_API}?method={method}&input=3&api_version=1.0&api_token={self.token}"
         body = json.dumps(params or {}).encode()
         req  = urllib.request.Request(url, data=body, headers={
@@ -115,11 +115,18 @@ class DeezerSession:
             "Origin": "https://www.deezer.com", "Referer": "https://www.deezer.com/",
         })
         with self._opener.open(req, timeout=15) as r:
-            return json.loads(r.read())
+            data = json.loads(r.read())
+            
+        if retry and (data.get("error") or not data.get("results")):
+            log.warning("Deezer GW error or empty results, refreshing token...")
+            if self.auth():
+                return self._gw(method, params, retry=False)
+                
+        return data
 
     def auth(self) -> bool:
         try:
-            d = self._gw("deezer.getUserData")["results"]
+            d = self._gw("deezer.getUserData", retry=False)["results"]
             u = d.get("USER", {})
             if not u.get("USER_ID"): return False
             self.token         = d.get("checkForm", "")
