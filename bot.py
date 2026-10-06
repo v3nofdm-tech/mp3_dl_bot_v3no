@@ -323,9 +323,11 @@ async def yt_download(url: str, out_dir: Path) -> list[Path]:
         "--print", "after_move:filepath",
         "-o", tpl,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _ = await proc.communicate()
+    stdout, stderr = await proc.communicate()
+    if stderr:
+        log.warning("yt-dlp stderr: %s", stderr.decode("utf-8", errors="replace")[-800:])
 
     produced = []
     if stdout:

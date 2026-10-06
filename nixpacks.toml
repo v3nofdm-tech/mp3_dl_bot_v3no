@@ -1,3 +1,2 @@
-[providers.python]
-# The python version to install
-setup = ["apt-get update", "apt-get install -y ffmpeg"]
+[phases.setup]
+nixPkgs = ["ffmpeg", "python312"]
