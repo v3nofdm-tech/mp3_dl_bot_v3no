@@ -310,39 +310,28 @@ def parse_deezer(url: str) -> tuple[str, str] | None:
 
 # ── DOWNLOADERS ────────────────────────────────────────────────────
 async def yt_download(url: str, out_dir: Path) -> list[Path]:
-    out_dir.mkdir(exist_ok=True)
-    uid = __import__("uuid").uuid4().hex[:8]
-    tpl = str(out_dir / f"{uid}.%(ext)s")
+    import uuid as _uuid
+    # Dossier unique par téléchargement → glob simple et sans conflit
+    work = out_dir / _uuid.uuid4().hex[:8]
+    work.mkdir(parents=True, exist_ok=True)
 
-    # --print after_move:filepath capture le vrai path après conversion M4A→MP3
     proc = await asyncio.create_subprocess_exec(
         "yt-dlp", url,
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
         "--no-playlist", "--embed-thumbnail", "--add-metadata",
         "--no-check-certificates", "--geo-bypass",
-        "--print", "after_move:filepath",
-        "-o", tpl,
+        "-o", str(work / "%(title)s.%(ext)s"),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await proc.communicate()
     if stderr:
-        log.warning("yt-dlp stderr: %s", stderr.decode("utf-8", errors="replace")[-800:])
+        log.warning("yt-dlp: %s", stderr.decode("utf-8", errors="replace")[-600:])
 
-    produced = []
-    if stdout:
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            p = Path(line.strip())
-            if p.exists() and p.suffix == ".mp3":
-                produced.append(p)
-
-    if not produced:
-        produced = list(out_dir.glob(f"{uid}*.mp3"))
-    if not produced:
-        produced = sorted(out_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)[-1:]
-    if not produced:
+    files = list(work.glob("*.mp3"))
+    if not files:
         raise RuntimeError("yt-dlp: aucun MP3 produit.")
-    return produced
+    return files
 
 async def sp_download(url: str, out_dir: Path) -> list[Path]:
     out_dir.mkdir(exist_ok=True)
