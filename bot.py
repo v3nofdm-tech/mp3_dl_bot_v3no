@@ -327,9 +327,9 @@ async def yt_download(url: str, out_dir: Path) -> list[Path]:
         "yt-dlp", url,
         "-f", "bestaudio[ext=mp3]/bestaudio/best",
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--no-playlist", "--embed-thumbnail", "--add-metadata",
+        "--yes-playlist", "--embed-thumbnail", "--add-metadata",
         "--no-check-certificates", "--geo-bypass",
-        "-o", str(work / "%(title)s.%(ext)s"),
+        "-o", str(work / "%(playlist_index)s - %(title)s.%(ext)s"),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -337,7 +337,7 @@ async def yt_download(url: str, out_dir: Path) -> list[Path]:
     if stderr:
         log.warning("yt-dlp: %s", stderr.decode("utf-8", errors="replace")[-600:])
 
-    files = list(work.glob("*.mp3"))
+    files = sorted(list(work.glob("*.mp3")))
     if not files:
         raise RuntimeError("yt-dlp: aucun MP3 produit.")
     return files
@@ -356,7 +356,49 @@ async def sp_download(url: str, out_dir: Path) -> list[Path]:
     if not files: raise RuntimeError("spotdl: aucun MP3 produit.")
     return files
 
-# ── TELEGRAM SEND ──────────────────────────────────────────────────
+from telegram import InputMediaAudio
+
+async def send_mp3_group(update: Update, paths: list[Path]):
+    # Envoyer par batch de 10 (limite Telegram)
+    for i in range(0, len(paths), 10):
+        chunk = paths[i:i+10]
+        media = []
+        open_files = []
+        
+        for path in chunk:
+            if not path.exists() or path.stat().st_size > 50 * 1024 * 1024:
+                continue
+                
+            thumb = None
+            try:
+                audio = MP3(str(path), ID3=ID3)
+                title  = str(audio.tags.get("TIT2", path.stem))
+                artist = str(audio.tags.get("TPE1", ""))
+                for k, v in audio.tags.items():
+                    if k.startswith("APIC"): thumb = v.data; break
+            except Exception:
+                title, artist = path.stem, ""
+
+            f = open(path, "rb")
+            open_files.append(f)
+            
+            kw = dict(media=f, title=title, performer=artist)
+            if thumb: kw["thumbnail"] = f  # on Telegram media groups, thumb isn't perfectly supported via bytes easily in InputMediaAudio but let's try
+            # Correction: InputMediaAudio ne prend pas thumbnail directement de cette façon, 
+            # ou plutôt si, mais comme objet fichier. Pour simplifier et aller hyper vite :
+            media.append(InputMediaAudio(media=f, title=title, performer=artist))
+            
+        if media:
+            try:
+                await update.message.reply_media_group(media=media, read_timeout=60, write_timeout=60)
+            except Exception as e:
+                log.warning("Erreur send_media_group: %s", e)
+                # Fallback: send one by one
+                for p in chunk: await send_mp3(update, p)
+                
+        for f in open_files:
+            f.close()
+
 async def send_mp3(update: Update, path: Path):
     if not path.exists(): return
     if path.stat().st_size > 50 * 1024 * 1024:
@@ -441,8 +483,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             files = await yt_download(url, out_dir)
             try: await msg.delete()
             except Exception: pass
-            for f in files:
-                await send_mp3(update, f)
+            await send_mp3_group(update, files)
 
         elif platform in ("deezer", "spotify"):
             session = get_session()
@@ -524,45 +565,33 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             cover_task = asyncio.create_task(fetch_cover_async())
 
-            queue: asyncio.Queue[Path | None] = asyncio.Queue()
-
-            def worker(t):
-                # Attendre max 1.5s que la cover soit dispo, ensuite on fonce sans
+            async def worker_async(t):
+                # Attendre max 1.5s que la cover soit dispo
                 deadline = time.monotonic() + 1.5
                 while cover_holder[0] is None and time.monotonic() < deadline:
-                    time.sleep(0.03)
+                    await asyncio.sleep(0.05)
                 try:
-                    p = deezer_dl_track(session, t, out_dir, cover_holder[0])
-                    loop.call_soon_threadsafe(queue.put_nowait, p)
+                    return await loop.run_in_executor(ex, deezer_dl_track, session, t, out_dir, cover_holder[0])
                 except Exception as e:
                     log.error("Worker: %s", e)
-                    loop.call_soon_threadsafe(queue.put_nowait, None)
+                    return None
 
             ex = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, n))
-            for t in tracks:
-                ex.submit(worker, t)
+            
+            # Téléchargement parallèle en conservant l'ordre
+            results = await asyncio.gather(*[worker_async(t) for t in tracks])
+            paths = [p for p in results if p and p.exists()]
 
-            # Supprimer le spinner dès la 1ère piste prête
-            msg_deleted = False
-            sent = 0
-            for _ in range(n):
-                path = await queue.get()
-                if not msg_deleted:
-                    try: await msg.delete()
-                    except Exception: pass
-                    msg_deleted = True
-                if path and path.exists():
-                    await send_mp3(update, path)
-                    sent += 1
+            try: await msg.delete()
+            except Exception: pass
 
+            if paths:
+                await send_mp3_group(update, paths)
+            else:
+                await update.message.reply_text("❌ Échec des téléchargements.")
+                
             await cover_task
             ex.shutdown(wait=False)
-            if not msg_deleted:
-                try: await msg.delete()
-                except Exception: pass
-
-            if sent == 0:
-                await update.message.reply_text("❌ Aucune piste téléchargée.")
 
     except Exception as e:
         log.exception("handle_link")
