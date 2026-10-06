@@ -313,18 +313,34 @@ async def yt_download(url: str, out_dir: Path) -> list[Path]:
     out_dir.mkdir(exist_ok=True)
     uid = __import__("uuid").uuid4().hex[:8]
     tpl = str(out_dir / f"{uid}.%(ext)s")
+
+    # --print after_move:filepath capture le vrai path après conversion M4A→MP3
     proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", url, "-x", "--audio-format", "mp3", "--audio-quality", "0",
+        "yt-dlp", url,
+        "-x", "--audio-format", "mp3", "--audio-quality", "0",
         "--no-playlist", "--embed-thumbnail", "--add-metadata",
-        "--no-check-certificates", "--geo-bypass", "-o", tpl,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        "--no-check-certificates", "--geo-bypass",
+        "--print", "after_move:filepath",
+        "-o", tpl,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    await proc.communicate()
-    files = list(out_dir.glob(f"{uid}*.mp3"))
-    if not files:
-        files = sorted(out_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)[-1:]
-    if not files: raise RuntimeError("yt-dlp: aucun MP3 produit.")
-    return files
+    stdout, _ = await proc.communicate()
+
+    produced = []
+    if stdout:
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            p = Path(line.strip())
+            if p.exists() and p.suffix == ".mp3":
+                produced.append(p)
+
+    if not produced:
+        produced = list(out_dir.glob(f"{uid}*.mp3"))
+    if not produced:
+        produced = sorted(out_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)[-1:]
+    if not produced:
+        raise RuntimeError("yt-dlp: aucun MP3 produit.")
+    return produced
 
 async def sp_download(url: str, out_dir: Path) -> list[Path]:
     out_dir.mkdir(exist_ok=True)
