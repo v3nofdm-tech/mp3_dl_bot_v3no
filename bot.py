@@ -329,6 +329,7 @@ async def yt_download(url: str, out_dir: Path) -> list[Path]:
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
         "--yes-playlist", "--embed-thumbnail", "--add-metadata",
         "--no-check-certificates", "--geo-bypass",
+        "--extractor-args", "youtube:player_client=android",
         "-o", str(work / "%(playlist_index)s - %(title)s.%(ext)s"),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
