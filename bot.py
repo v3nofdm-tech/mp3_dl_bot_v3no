@@ -325,6 +325,7 @@ async def yt_download(url: str, out_dir: Path) -> list[Path]:
 
     proc = await asyncio.create_subprocess_exec(
         "yt-dlp", url,
+        "-f", "bestaudio[ext=mp3]/bestaudio/best",
         "-x", "--audio-format", "mp3", "--audio-quality", "0",
         "--no-playlist", "--embed-thumbnail", "--add-metadata",
         "--no-check-certificates", "--geo-bypass",
