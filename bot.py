@@ -294,11 +294,13 @@ def deezer_dl_track(session: DeezerSession, track: dict,
 _YT_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+", re.I)
 _SP_RE = re.compile(r"(https?://)?(open\.)?spotify\.com/(track|album|playlist)/.+", re.I)
 _DZ_RE = re.compile(r"deezer\.com/(?:\w{2}/)?(track|album|playlist)/(\d+)", re.I)
+_SC_RE = re.compile(r"(https?://)?(www\.)?soundcloud\.com/.+", re.I)
 
 def detect(text: str) -> tuple[str, str] | None:
     t = text.strip()
     if _YT_RE.match(t): return "youtube", t
     if _SP_RE.match(t): return "spotify", t
+    if _SC_RE.match(t): return "soundcloud", t
     if re.search(r"deezer\.com", t, re.I): return "deezer", t
     return None
 
@@ -372,7 +374,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dz = f"✅ Deezer CDN ({s.user} · {s.plan})" if s else "❌ Deezer off — `/set_arl <arl>`"
     await update.message.reply_text(
         "🎵 *MP3 Bot v6*\n\n"
-        "• Lien **Deezer / Spotify / YouTube** → MP3 + cover\n"
+        "• Lien **Deezer / Spotify / YouTube / SoundCloud** → MP3 + cover\n"
         "• Fichier **.mp3** → éditeur de tags\n\n"
         "💡 Tape /help pour voir toutes les commandes.\n\n" + dz,
         parse_mode="Markdown",
@@ -381,7 +383,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🛠 *Commandes Dispos :*\n\n"
-        "🔗 *Envoyer un lien* : Spotify, Deezer ou YouTube pour un téléchargement immédiat.\n"
+        "🔗 *Envoyer un lien* : Spotify, Deezer, YouTube ou SoundCloud pour un téléchargement immédiat.\n"
         "🎵 *Envoyer un fichier mp3* : Ouvre l'éditeur de métadonnées intégré.\n"
         "🔑 `/set_arl <ton_arl>` : Connecte ton compte Deezer pour la qualité max.\n"
         "🔎 `/search <artiste ou titre>` : (bientôt) Chercher et télécharger directement depuis Telegram.\n"
@@ -419,7 +421,7 @@ async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(f"⏳ *{platform.upper()}*...", parse_mode="Markdown")
 
     try:
-        if platform == "youtube":
+        if platform in ("youtube", "soundcloud"):
             files = await yt_download(url, out_dir)
             try: await msg.delete()
             except Exception: pass
