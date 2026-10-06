@@ -27,6 +27,14 @@ MAX_WORKERS = 16
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
+# Injecte ffmpeg dans le PATH si pas trouvé (Railway, Docker, etc.)
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+    log.info("ffmpeg injecté via static-ffmpeg")
+except Exception as _e:
+    log.warning("static-ffmpeg non dispo: %s", _e)
+
 # ── DEEZER CRYPTO ──────────────────────────────────────────────────
 _GW_API    = "https://www.deezer.com/ajax/gw-light.php"
 _MEDIA_API = "https://media.deezer.com/v1/get_url"

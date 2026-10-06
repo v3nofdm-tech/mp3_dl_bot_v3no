@@ -3,3 +3,4 @@ mutagen
 python-telegram-bot[job-queue]
 spotdl
 yt-dlp
+static-ffmpeg
