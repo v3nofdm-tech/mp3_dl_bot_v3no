@@ -1,697 +1,335 @@
-"""
-🎵 MP3 BOT — Direct Deezer CDN · YouTube · Spotify · Metadata editor
-"""
-
-import os, re, json, hashlib, asyncio, logging, tempfile, time
-import urllib.request, urllib.parse, http.cookiejar
+import os
+import io
+import time
+import asyncio
+import logging
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
-from Crypto.Cipher import Blowfish, AES
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, TRCK, APIC, TDRC, ID3NoHeaderError
-from mutagen.mp3 import MP3
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    InputMediaAudio,
+)
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, ContextTypes, filters,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
 )
 
-# ── CONFIG ─────────────────────────────────────────────────────────
-BOT_TOKEN   = "8618131684:AAGQmyd-F-5TcDilO4lZUu_WH3HQVxhYyXw"
-TMPDIR      = Path(tempfile.gettempdir()) / "mp3bot"
-TMPDIR.mkdir(exist_ok=True)
-MAX_WORKERS = 16
+from mutagen.mp3 import MP3, HeaderNotFoundError
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TCON, TRCK, APIC, ID3NoHeaderError
+
+# ── CONFIGURATION ──────────────────────────────────────────────────
+BOT_TOKEN = "8618131684:AAGQmyd-F-5TcDilO4lZUu_WH3HQVxhYyXw"
+TMPDIR    = Path(__import__("tempfile").gettempdir()) / "v3no_tagger"
+TMPDIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-log = logging.getLogger("bot")
+log = logging.getLogger("V3noTagger")
 
-# Injecte ffmpeg dans le PATH si pas trouvé (Railway, Docker, etc.)
-try:
-    import static_ffmpeg
-    static_ffmpeg.add_paths()
-    log.info("ffmpeg injecté via static-ffmpeg")
-except Exception as _e:
-    log.warning("static-ffmpeg non dispo: %s", _e)
+# ── ETATS DE LA CONVERSATION ────────────────────────────────────────
+EDIT_MENU = 0
+WAITING_TEXT = 1
+WAITING_COVER = 2
 
-# ── DEEZER CRYPTO ──────────────────────────────────────────────────
-_GW_API    = "https://www.deezer.com/ajax/gw-light.php"
-_MEDIA_API = "https://media.deezer.com/v1/get_url"
-_URL_KEY   = b"jo6aey6haid2Teih"
-_BF_SECRET = "g4el58wc0zvf9na1"
-_SEP       = b"\xa4"
-
-_QUALITY_CHAIN = [
-    ("FLAC",    9, "FILESIZE_FLAC"),
-    ("MP3_320", 3, "FILESIZE_MP3_320"),
-    ("MP3_128", 1, "FILESIZE_MP3_128"),
-]
-
-def _bf_key(sng_id: str) -> bytes:
-    h = hashlib.md5(str(sng_id).encode()).hexdigest()
-    return bytes(ord(h[i]) ^ ord(h[i+16]) ^ ord(_BF_SECRET[i]) for i in range(16))
-
-def _cdn_url(md5: str, quality: int, sng_id: str, version: str) -> str:
-    step1 = _SEP.join([md5.encode(), str(quality).encode(), sng_id.encode(), version.encode()])
-    md5v  = hashlib.md5(step1).hexdigest().encode()
-    step2 = md5v + _SEP + step1 + _SEP
-    while len(step2) % 16: step2 += b"."
-    enc = AES.new(_URL_KEY, AES.MODE_ECB).encrypt(step2)
-    return f"https://e-cdns-proxy-{md5[0]}.dzcdn.net/mobile/1/{enc.hex()}"
-
-def _decrypt_stream(url: str, sng_id: str) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        key = _bf_key(sng_id)
-        iv  = bytes(range(8))
-        buf, idx = BytesIO(), 0
-        while True:
-            chunk = resp.read(2048)
-            if not chunk: break
-            if idx % 3 == 0 and len(chunk) == 2048:
-                chunk = Blowfish.new(key, Blowfish.MODE_CBC, iv).decrypt(chunk)
-            buf.write(chunk)
-            idx += 1
-    return buf.getvalue()
-
-# ── DEEZER SESSION ─────────────────────────────────────────────────
-def _get_arl() -> str:
-    for p in [
-        os.path.join(os.path.expandvars(r"%APPDATA%"), "deezer_ripper", ".arl"),
-        os.path.join(os.path.dirname(__file__), "deemix_config", ".arl"),
-    ]:
-        if os.path.exists(p):
-            v = open(p, encoding="utf-8").read().strip()
-            if v: return v
-    cred = os.path.join(os.path.expandvars(r"%APPDATA%"), "deemix", ".credentials")
-    if os.path.exists(cred):
-        try:
-            v = json.load(open(cred)).get("arl", "").strip()
-            if v: return v
-        except Exception: pass
-    return "51f67d6819e3dace58aa0a84d8e4f036d3a94bb31bd7c578032011a9360c7f4b5abd1032b93e4f94d42a6e81f320e45dd5957b18d6fee3712119da5057ca3e602e6ea8661ffbb9eb393b0d14bb982902ca760da8474995a453abcf6badfc03a1"
-
-def _save_arl(arl: str):
-    for p in [
-        os.path.join(os.path.expandvars(r"%APPDATA%"), "deezer_ripper", ".arl"),
-        os.path.join(os.path.dirname(__file__), "deemix_config", ".arl"),
-    ]:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        try: open(p, "w", encoding="utf-8").write(arl)
-        except Exception: pass
-
-class DeezerSession:
-    def __init__(self, arl: str):
-        self.arl = arl
-        self.token = ""
-        self.license_token = ""
-        self.user = "?"
-        self.plan = "Free"
-        self._cj = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self._cj))
-        self._cj.set_cookie(http.cookiejar.Cookie(
-            0, "arl", arl, None, False, ".deezer.com", True, True,
-            "/", True, True, None, True, None, None, {}, False,
-        ))
-
-    def _gw(self, method: str, params: dict = None, retry=True) -> dict:
-        url  = f"{_GW_API}?method={method}&input=3&api_version=1.0&api_token={self.token}"
-        body = json.dumps(params or {}).encode()
-        req  = urllib.request.Request(url, data=body, headers={
-            "User-Agent": "Mozilla/5.0", "Content-Type": "application/json",
-            "Origin": "https://www.deezer.com", "Referer": "https://www.deezer.com/",
-        })
-        with self._opener.open(req, timeout=15) as r:
-            data = json.loads(r.read())
-            
-        if retry and (data.get("error") or not data.get("results")):
-            log.warning("Deezer GW error or empty results, refreshing token...")
-            if self.auth():
-                return self._gw(method, params, retry=False)
-                
-        return data
-
-    def auth(self) -> bool:
-        try:
-            d = self._gw("deezer.getUserData", retry=False)["results"]
-            u = d.get("USER", {})
-            if not u.get("USER_ID"): return False
-            self.token         = d.get("checkForm", "")
-            self.license_token = u.get("OPTIONS", {}).get("license_token", "")
-            self.user          = u.get("BLOG_NAME", "?")
-            sq = u.get("OPTIONS", {}).get("web_sound_quality", {})
-            self.plan = "HiFi" if sq.get("lossless") else "Premium" if sq.get("high") else "Free"
-            return True
-        except Exception as e:
-            log.error("Auth: %s", e)
-            return False
-
-    def track_info(self, sng_id) -> dict:
-        return self._gw("song.getData", {"sng_id": str(sng_id)}).get("results", {})
-
-    def album_tracks(self, alb_id) -> list:
-        return self._gw("song.getListByAlbum", {"alb_id": int(alb_id), "nb": 500}).get("results", {}).get("data", [])
-
-    def playlist_tracks(self, pl_id) -> list:
-        return self._gw("playlist.getSongs", {"playlist_id": int(pl_id), "nb": 2000}).get("results", {}).get("data", [])
-
-    def get_url(self, track: dict, quality_name: str, quality_code: int) -> str | None:
-        token = track.get("TRACK_TOKEN")
-        if self.license_token and token:
-            try:
-                body = json.dumps({
-                    "license_token": self.license_token,
-                    "media": [{"type": "FULL", "formats": [{"cipher": "BF_CBC_STRIPE", "format": quality_name}]}],
-                    "track_tokens": [token],
-                }).encode()
-                req = urllib.request.Request(_MEDIA_API, data=body, headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    d = json.loads(r.read())
-                    srcs = d.get("data", [{}])[0].get("media", [{}])[0].get("sources", [])
-                    if srcs: return srcs[0]["url"]
-            except Exception: pass
-        md5 = track.get("MD5_ORIGIN", "")
-        ver = track.get("MEDIA_VERSION", "")
-        sid = track.get("SNG_ID", "")
-        if md5 and ver and sid:
-            return _cdn_url(md5, quality_code, sid, ver)
-        return None
-
-_SESSION: DeezerSession | None = None
-
-def get_session() -> DeezerSession | None:
-    global _SESSION
-    if _SESSION is None:
-        s = DeezerSession(_get_arl())
-        if s.auth():
-            _SESSION = s
-            log.info("Deezer: %s (%s)", s.user, s.plan)
-    return _SESSION
-
-# ── COVER ART ──────────────────────────────────────────────────────
-_cover_cache: dict[str, bytes] = {}
-
-def get_cover(md5_img: str, size: int = 500) -> bytes | None:
-    if not md5_img: return None
-    key = f"{md5_img}_{size}"
-    if key in _cover_cache: return _cover_cache[key]
-    url = f"https://e-cdns-images.dzcdn.net/images/cover/{md5_img}/{size}x{size}-000000-80-0-0.jpg"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = r.read()
-        _cover_cache[key] = data
-        return data
-    except Exception: return None
-
-# ── TAGGING ────────────────────────────────────────────────────────
-def tag_mp3(path: Path, title="", artist="", album="", track_num="", year="", cover: bytes = None):
+# ── FONCTIONS TAGS ─────────────────────────────────────────────────
+def read_tags(path: Path) -> dict:
     try:
         audio = MP3(str(path), ID3=ID3)
-        try: audio.add_tags()
-        except Exception: pass
+        if audio.tags is None:
+            audio.add_tags()
         T = audio.tags
-        if title:     T.add(TIT2(encoding=3, text=[title]))
-        if artist:    T.add(TPE1(encoding=3, text=[artist]))
-        if album:     T.add(TALB(encoding=3, text=[album]))
-        if track_num: T.add(TRCK(encoding=3, text=[str(track_num)]))
-        if year:      T.add(TDRC(encoding=3, text=[str(year)[:4]]))
-        if cover:
-            T.add(APIC(encoding=0, mime="image/jpeg", type=3, desc="Cover", data=cover))
-        audio.save(v2_version=3)
-    except Exception as e:
-        log.warning("Tag error: %s", e)
+    except Exception:
+        T = ID3()
 
-def read_tags(path: Path) -> dict:
-    try: T = ID3(str(path))
-    except ID3NoHeaderError: T = ID3()
     def s(k): return str(T.get(k, "")) or ""
-    return {"title": s("TIT2") or path.stem, "artist": s("TPE1"), "album": s("TALB")}
+    
+    cover_bytes = None
+    for k, v in T.items():
+        if k.startswith("APIC"):
+            cover_bytes = v.data
+            break
 
-def write_tags(path: Path, title="", artist="", album=""):
-    try: T = ID3(str(path))
-    except ID3NoHeaderError: T = ID3()
-    if title:  T["TIT2"] = TIT2(encoding=3, text=title)
-    if artist: T["TPE1"] = TPE1(encoding=3, text=artist)
-    if album:  T["TALB"] = TALB(encoding=3, text=album)
+    return {
+        "title": s("TIT2") or path.stem,
+        "artist": s("TPE1"),
+        "album": s("TALB"),
+        "year": s("TDRC")[:4],
+        "genre": s("TCON"),
+        "track": s("TRCK"),
+        "cover": cover_bytes,
+        "filename": path.name
+    }
+
+def write_tags(path: Path, tags: dict):
+    try:
+        audio = MP3(str(path), ID3=ID3)
+        if audio.tags is None:
+            audio.add_tags()
+        T = audio.tags
+    except Exception:
+        T = ID3()
+
+    if tags.get("title"):  T["TIT2"] = TIT2(encoding=3, text=tags["title"])
+    if tags.get("artist"): T["TPE1"] = TPE1(encoding=3, text=tags["artist"])
+    if tags.get("album"):  T["TALB"] = TALB(encoding=3, text=tags["album"])
+    if tags.get("year"):   T["TDRC"] = TDRC(encoding=3, text=tags["year"])
+    if tags.get("genre"):  T["TCON"] = TCON(encoding=3, text=tags["genre"])
+    if tags.get("track"):  T["TRCK"] = TRCK(encoding=3, text=tags["track"])
+    
+    if tags.get("cover"):
+        # Supprimer les anciennes covers
+        keys_to_del = [k for k in T.keys() if k.startswith("APIC")]
+        for k in keys_to_del: del T[k]
+        
+        T.add(APIC(
+            encoding=0, # Latin1
+            mime="image/jpeg", # Supporte JPEG ou PNG selon le fichier
+            type=3, # 3 is for the cover(front)
+            desc="Cover",
+            data=tags["cover"]
+        ))
+    
     T.save(str(path), v2_version=3)
 
-# ── DEEZER TRACK DOWNLOADER ────────────────────────────────────────
-_safename_re = re.compile(r'[<>:"/\\|?*]')
-def _safe(s: str) -> str:
-    return _safename_re.sub("_", s).strip()[:120]
-
-def _resolve_artist(track: dict) -> str:
-    """
-    Récupère tous les artistes principaux dans l'ordre affiché par Deezer.
-    Priorité: ARTISTS (ROLE_ID=0 trié) → SNG_CONTRIBUTORS.main_artist → ART_NAME
-    """
-    artists_list = track.get("ARTISTS") or []
-    if isinstance(artists_list, list) and artists_list:
-        mains = sorted(
-            [a for a in artists_list if str(a.get("ROLE_ID", "0")) == "0"],
-            key=lambda a: int(a.get("ARTISTS_SONGS_ORDER") or 99)
-        )
-        names = [a["ART_NAME"] for a in mains if a.get("ART_NAME")]
-        if not names:
-            names = [a["ART_NAME"] for a in artists_list if a.get("ART_NAME")]
-        if names: return " & ".join(names)
-    contrib = track.get("SNG_CONTRIBUTORS") or {}
-    mains   = contrib.get("main_artist", [])
-    if mains: return " & ".join(mains)
-    return track.get("ART_NAME", "?")
-
-def deezer_dl_track(session: DeezerSession, track: dict,
-                    out_dir: Path, cover: bytes | None) -> Path | None:
-    sng_id  = track.get("SNG_ID", "")
-    title   = track.get("SNG_TITLE", "?")
-    artist  = _resolve_artist(track)
-    album   = track.get("ALB_TITLE", "")
-    tnum    = track.get("TRACK_NUMBER", "")
-    year    = track.get("PHYSICAL_RELEASE_DATE", "")[:4]
-    alb_pic = track.get("ALB_PICTURE", "")
-
-    url = None
-    for qname, qcode, qsize_key in _QUALITY_CHAIN:
-        if int(track.get(qsize_key, 0) or 0) > 0:
-            url = session.get_url(track, qname, qcode)
-            if url: break
-
-    if not url:
-        log.warning("No URL: %s", title)
-        return None
-
-    try:
-        data = _decrypt_stream(url, sng_id)
-    except Exception as e:
-        log.error("Decrypt [%s]: %s", title, e)
-        return None
-
-    if len(data) < 1024:
-        return None
-
-    out_path = out_dir / f"{_safe(artist)} - {_safe(title)}.mp3"
-    out_path.write_bytes(data)
-    art = cover or get_cover(alb_pic)
-    tag_mp3(out_path, title=title, artist=artist, album=album,
-            track_num=tnum, year=year, cover=art)
-    return out_path
-
-# ── URL DETECTION ──────────────────────────────────────────────────
-_YT_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be|music\.youtube\.com)/.+", re.I)
-_SP_RE = re.compile(r"(https?://)?(open\.)?spotify\.com/(track|album|playlist)/.+", re.I)
-_DZ_RE = re.compile(r"deezer\.com/(?:\w{2}/)?(track|album|playlist)/(\d+)", re.I)
-_SC_RE = re.compile(r"(https?://)?(www\.)?soundcloud\.com/.+", re.I)
-
-def detect(text: str) -> tuple[str, str] | None:
-    t = text.strip()
-    if _YT_RE.match(t): return "youtube", t
-    if _SP_RE.match(t): return "spotify", t
-    if _SC_RE.match(t): return "soundcloud", t
-    if re.search(r"deezer\.com", t, re.I): return "deezer", t
-    return None
-
-def parse_deezer(url: str) -> tuple[str, str] | None:
-    m = _DZ_RE.search(url)
-    return (m.group(1), m.group(2)) if m else None
-
-# ── DOWNLOADERS ────────────────────────────────────────────────────
-async def yt_download(url: str, out_dir: Path) -> list[Path]:
-    import uuid as _uuid
-    # Dossier unique par téléchargement → glob simple et sans conflit
-    work = out_dir / _uuid.uuid4().hex[:8]
-    work.mkdir(parents=True, exist_ok=True)
-
-    proc = await asyncio.create_subprocess_exec(
-        "yt-dlp", url,
-        "-f", "bestaudio[ext=mp3]/bestaudio/best",
-        "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "--yes-playlist", "--embed-thumbnail", "--add-metadata",
-        "--no-check-certificates", "--geo-bypass",
-        "--extractor-args", "youtube:player_client=android",
-        "-o", str(work / "%(playlist_index)s - %(title)s.%(ext)s"),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if stderr:
-        log.warning("yt-dlp: %s", stderr.decode("utf-8", errors="replace")[-600:])
-
-    files = sorted(list(work.glob("*.mp3")))
-    if not files:
-        raise RuntimeError("yt-dlp: aucun MP3 produit.")
-    return files
-
-async def sp_download(url: str, out_dir: Path) -> list[Path]:
-    out_dir.mkdir(exist_ok=True)
-    proc = await asyncio.create_subprocess_exec(
-        "spotdl", "download", url,
-        "--output", str(out_dir / "{title} - {artists}.{output-ext}"),
-        "--format", "mp3", "--threads", "4",
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-        cwd=str(out_dir),
-    )
-    await proc.communicate()
-    files = sorted(out_dir.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
-    if not files: raise RuntimeError("spotdl: aucun MP3 produit.")
-    return files
-
-from telegram import InputMediaAudio
-
-async def send_mp3_group(update: Update, paths: list[Path]):
-    # Envoyer par batch de 10 (limite Telegram)
-    for i in range(0, len(paths), 10):
-        chunk = paths[i:i+10]
-        media = []
-        open_files = []
-        
-        for path in chunk:
-            if not path.exists() or path.stat().st_size > 50 * 1024 * 1024:
-                continue
-                
-            thumb = None
-            try:
-                audio = MP3(str(path), ID3=ID3)
-                title  = str(audio.tags.get("TIT2", path.stem))
-                artist = str(audio.tags.get("TPE1", ""))
-                for k, v in audio.tags.items():
-                    if k.startswith("APIC"): thumb = v.data; break
-            except Exception:
-                title, artist = path.stem, ""
-
-            f = open(path, "rb")
-            open_files.append(f)
-            
-            kw = dict(media=f, title=title, performer=artist)
-            if thumb: kw["thumbnail"] = f  # on Telegram media groups, thumb isn't perfectly supported via bytes easily in InputMediaAudio but let's try
-            # Correction: InputMediaAudio ne prend pas thumbnail directement de cette façon, 
-            # ou plutôt si, mais comme objet fichier. Pour simplifier et aller hyper vite :
-            media.append(InputMediaAudio(media=f, title=title, performer=artist))
-            
-        if media:
-            try:
-                await update.message.reply_media_group(media=media, read_timeout=60, write_timeout=60)
-            except Exception as e:
-                log.warning("Erreur send_media_group: %s", e)
-                # Fallback: send one by one
-                for p in chunk: await send_mp3(update, p)
-                
-        for f in open_files:
-            f.close()
-
-async def send_mp3(update: Update, path: Path):
-    if not path.exists(): return
-    if path.stat().st_size > 50 * 1024 * 1024:
-        await update.message.reply_text(f"⚠️ `{path.name}` >50 Mo", parse_mode="Markdown")
-        return
-    thumb = None
-    try:
-        audio = MP3(str(path), ID3=ID3)
-        title  = str(audio.tags.get("TIT2", path.stem))
-        artist = str(audio.tags.get("TPE1", ""))
-        album  = str(audio.tags.get("TALB", ""))
-        for k, v in audio.tags.items():
-            if k.startswith("APIC"): thumb = v.data; break
-    except Exception:
-        title, artist, album = path.stem, "", ""
-
-    caption = f"🎶 *{title}*"
-    if artist: caption += f"\n🎤 {artist}"
-    if album:  caption += f"\n💿 {album}"
-
-    with open(path, "rb") as f:
-        kw = dict(audio=f, caption=caption, parse_mode="Markdown",
-                  title=title, performer=artist,
-                  read_timeout=60, write_timeout=60)
-        if thumb: kw["thumbnail"] = BytesIO(thumb)
-        await update.message.reply_audio(**kw)
-
-# ── TELEGRAM HANDLERS ──────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    s = get_session()
-    dz = f"✅ Deezer CDN ({s.user} · {s.plan})" if s else "❌ Deezer off — `/set_arl <arl>`"
-    await update.message.reply_text(
-        "🎵 *MP3 Bot v6*\n\n"
-        "• Lien **Deezer / Spotify / YouTube / SoundCloud** → MP3 + cover\n"
-        "• Fichier **.mp3** → éditeur de tags\n\n"
-        "💡 Tape /help pour voir toutes les commandes.\n\n" + dz,
-        parse_mode="Markdown",
-    )
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🛠 *Commandes Dispos :*\n\n"
-        "🔗 *Envoyer un lien* : Spotify, Deezer, YouTube ou SoundCloud pour un téléchargement immédiat.\n"
-        "🎵 *Envoyer un fichier mp3* : Ouvre l'éditeur de métadonnées intégré.\n"
-        "🔑 `/set_arl <ton_arl>` : Connecte ton compte Deezer pour la qualité max.\n"
-        "🔎 `/search <artiste ou titre>` : (bientôt) Chercher et télécharger directement depuis Telegram.\n"
-        "🛑 `/cancel` : Annule l'édition en cours.\n",
-        parse_mode="Markdown",
-    )
-
-async def cmd_set_arl(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global _SESSION
-    if not ctx.args:
-        await update.message.reply_text("Usage : `/set_arl <ton_arl>`", parse_mode="Markdown")
-        return
-    arl = ctx.args[0].strip()
-    _save_arl(arl)
-    _SESSION = None
-    s = get_session()
-    if s:
-        await update.message.reply_text(f"✅ *{s.user}* ({s.plan})", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ ARL invalide ou expiré.")
-
-async def handle_link(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    result = detect(text)
-    if not result: return
-
-    platform, url = result
-    chat_id = update.effective_chat.id
-    out_dir = TMPDIR / str(chat_id)
-    out_dir.mkdir(exist_ok=True)
-    for f in out_dir.rglob("*.mp3"):
-        try: f.unlink()
-        except Exception: pass
-
-    msg = await update.message.reply_text(f"⏳ *{platform.upper()}*...", parse_mode="Markdown")
-
-    try:
-        if platform in ("youtube", "soundcloud"):
-            files = await yt_download(url, out_dir)
-            try: await msg.delete()
-            except Exception: pass
-            await send_mp3_group(update, files)
-
-        elif platform in ("deezer", "spotify"):
-            session = get_session()
-            if not session:
-                await msg.edit_text("❌ Deezer indispo — `/set_arl <arl>`", parse_mode="Markdown")
-                return
-
-            loop = asyncio.get_running_loop()
-            tracks = []
-
-            if platform == "spotify":
-                import subprocess
-                mfile = out_dir / "meta.spotdl"
-                proc = await asyncio.create_subprocess_exec(
-                    "spotdl", "save", url, "--save-file", str(mfile),
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-                )
-                await proc.communicate()
-                if not mfile.exists():
-                    await msg.edit_text("❌ Erreur metadata Spotify.")
-                    return
-                try:
-                    sdata = json.loads(mfile.read_text("utf-8"))
-                    
-                    def _search(query):
-                        try:
-                            r = urllib.request.urlopen(f"https://api.deezer.com/search?q={urllib.parse.quote(query)}&limit=1").read()
-                            return json.loads(r).get("data", [])
-                        except Exception: return []
-
-                    async def _find_on_deezer(t):
-                        q = f"{t.get('name', '')} {t.get('artist', '')}".strip()
-                        if not q: return None
-                        res = await loop.run_in_executor(None, _search, q)
-                        if res:
-                            return await loop.run_in_executor(None, session.track_info, res[0]["id"])
-                        return None
-
-                    # Recherche concurrentielle pour toutes les pistes Spotify
-                    found = await asyncio.gather(*[_find_on_deezer(t) for t in sdata])
-                    tracks = [t for t in found if t]
-                    
-                except Exception as e:
-                    log.error("Spotify meta parse: %s", e)
-
-            else:
-                # ── DEEZER NORMAL ──
-                ptype = parse_deezer(url)
-                if not ptype:
-                    await msg.edit_text("❌ Lien invalide.")
-                    return
-                kind, obj_id = ptype
-
-                if kind == "track":
-                    raw    = await loop.run_in_executor(None, session.track_info, obj_id)
-                    tracks = [raw] if raw else []
-                elif kind == "album":
-                    tracks = await loop.run_in_executor(None, session.album_tracks, obj_id)
-                elif kind == "playlist":
-                    tracks = await loop.run_in_executor(None, session.playlist_tracks, obj_id)
-                else:
-                    tracks = []
-
-            if not tracks:
-                await msg.edit_text("❌ Aucune piste.")
-                return
-
-            n = len(tracks)
-
-            # ── Télécharger la cover + toutes les pistes en PARALLÈLE ──
-            # La cover est partagée entre les workers via cover_holder[]
-            alb_pic      = tracks[0].get("ALB_PICTURE", "")
-            cover_holder = [None]       # mutable pour accès thread-safe (GIL suffit)
-            cover_ready  = asyncio.Event()
-
-            async def fetch_cover_async():
-                cover_holder[0] = await loop.run_in_executor(None, get_cover, alb_pic)
-                cover_ready.set()
-
-            cover_task = asyncio.create_task(fetch_cover_async())
-
-            async def worker_async(t):
-                # Attendre max 1.5s que la cover soit dispo
-                deadline = time.monotonic() + 1.5
-                while cover_holder[0] is None and time.monotonic() < deadline:
-                    await asyncio.sleep(0.05)
-                try:
-                    return await loop.run_in_executor(ex, deezer_dl_track, session, t, out_dir, cover_holder[0])
-                except Exception as e:
-                    log.error("Worker: %s", e)
-                    return None
-
-            ex = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, n))
-            
-            # Téléchargement parallèle en conservant l'ordre
-            results = await asyncio.gather(*[worker_async(t) for t in tracks])
-            paths = [p for p in results if p and p.exists()]
-
-            try: await msg.delete()
-            except Exception: pass
-
-            if paths:
-                await send_mp3_group(update, paths)
-            else:
-                await update.message.reply_text("❌ Échec des téléchargements.")
-                
-            await cover_task
-            ex.shutdown(wait=False)
-
-    except Exception as e:
-        log.exception("handle_link")
-        try: await msg.edit_text(f"❌ `{str(e)[:250]}`", parse_mode="Markdown")
-        except Exception: pass
-
-# ── METADATA EDITOR ────────────────────────────────────────────────
-EDIT = 0
-
+# ── INTERFACE UTILISATEUR ──────────────────────────────────────────
 def _tag_kb(tags: dict) -> InlineKeyboardMarkup:
+    has_cover = "✅ Oui" if tags.get("cover") else "❌ Non"
+    
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📝 {tags['title'][:38]}", callback_data="e_title")],
-        [InlineKeyboardButton(f"🎤 {tags['artist'][:38] or '—'}", callback_data="e_artist")],
-        [InlineKeyboardButton(f"💿 {tags['album'][:38] or '—'}", callback_data="e_album")],
-        [InlineKeyboardButton("✅ Valider", callback_data="e_ok"),
-         InlineKeyboardButton("❌ Annuler", callback_data="e_cancel")],
+        [InlineKeyboardButton(f"📝 Titre : {tags['title'][:30]}", callback_data="set_title")],
+        [InlineKeyboardButton(f"🎤 Artiste : {tags['artist'][:30] or '—'}", callback_data="set_artist")],
+        [InlineKeyboardButton(f"💿 Album : {tags['album'][:30] or '—'}", callback_data="set_album")],
+        [
+            InlineKeyboardButton(f"📅 Année : {tags['year'] or '—'}", callback_data="set_year"),
+            InlineKeyboardButton(f"🔢 Piste : {tags['track'] or '—'}", callback_data="set_track")
+        ],
+        [InlineKeyboardButton(f"🎸 Genre : {tags['genre'] or '—'}", callback_data="set_genre")],
+        [InlineKeyboardButton(f"🖼️ Cover (Image) : {has_cover}", callback_data="set_cover")],
+        [
+            InlineKeyboardButton("✅ Sauvegarder", callback_data="save"),
+            InlineKeyboardButton("❌ Annuler", callback_data="cancel")
+        ]
     ])
+
+def _get_menu_text(tags: dict) -> str:
+    return (
+        f"🎧 *V3NO TAG EDITOR UHQ*\n\n"
+        f"Fichier : `{tags['filename']}`\n\n"
+        f"Choisis un champ à modifier ci-dessous :"
+    )
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎛 *V3no Tag Editor UHQ*\n\n"
+        "Bienvenue dans l'éditeur de tags MP3 ultime.\n"
+        "Envoie-moi simplement un fichier `.mp3` pour commencer à l'éditer !\n\n"
+        "• Titre, Artiste, Album, Année, Genre\n"
+        "• Numéro de piste\n"
+        "• Ajout ou modification de la Cover Art (Pochette)",
+        parse_mode="Markdown"
+    )
 
 async def handle_audio_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     audio = update.message.audio or update.message.document
     if not audio: return ConversationHandler.END
+    
     fname = getattr(audio, "file_name", None) or "track.mp3"
     if not (fname.lower().endswith(".mp3") or
             getattr(audio, "mime_type", "") in ("audio/mpeg", "audio/mp3")):
-        await update.message.reply_text("Envoie un *.mp3*", parse_mode="Markdown")
+        await update.message.reply_text("❌ Veuillez envoyer un fichier *.mp3*", parse_mode="Markdown")
         return ConversationHandler.END
 
-    edt_dir = TMPDIR / str(update.effective_chat.id) / "edit"
+    chat_id = str(update.effective_chat.id)
+    edt_dir = TMPDIR / chat_id
     edt_dir.mkdir(parents=True, exist_ok=True)
-    msg = await update.message.reply_text("⏳...")
-    tg    = await audio.get_file()
-    local = edt_dir / fname
-    await tg.download_to_drive(str(local))
-    await msg.delete()
-
-    ctx.user_data.update(edit_file=str(local), edit_field=None, tags=read_tags(local))
-    tags = ctx.user_data["tags"]
-    await update.message.reply_text(
-        f"📋 *Tags :*\n📝 `{tags['title']}`\n🎤 `{tags['artist']}`\n💿 `{tags['album']}`",
-        reply_markup=_tag_kb(tags), parse_mode="Markdown",
+    
+    msg = await update.message.reply_text("⏳ Chargement du fichier...")
+    
+    tg_file = await audio.get_file()
+    
+    # Save with unique name to prevent collisions
+    uid = __import__("uuid").uuid4().hex[:8]
+    local = edt_dir / f"{uid}_{fname}"
+    await tg_file.download_to_drive(str(local))
+    
+    tags = read_tags(local)
+    
+    ctx.user_data.clear()
+    ctx.user_data.update(
+        edit_file=str(local),
+        tags=tags,
+        msg_id=msg.message_id
     )
-    return EDIT
+    
+    await msg.edit_text(
+        _get_menu_text(tags),
+        reply_markup=_tag_kb(tags),
+        parse_mode="Markdown"
+    )
+    return EDIT_MENU
 
 async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-
-    if data in ("e_title", "e_artist", "e_album"):
-        ctx.user_data["edit_field"] = data[2:]
-        labels = {"title": "titre", "artist": "artiste", "album": "album"}
-        await q.message.reply_text(f"Envoie le nouveau **{labels[data[2:]]}** :", parse_mode="Markdown")
-        return EDIT
-
-    if data == "e_cancel":
-        _cleanup(ctx)
-        await q.message.reply_text("❌ Annulé.")
+    tags = ctx.user_data.get("tags")
+    
+    if not tags:
+        await q.message.edit_text("❌ Session expirée. Renvoyez le fichier MP3.")
         return ConversationHandler.END
 
-    if data == "e_ok":
+    if data.startswith("set_"):
+        field = data.split("_")[1]
+        
+        if field == "cover":
+            await q.message.edit_text(
+                "🖼️ *Modification de la Cover*\n\n"
+                "Envoyez-moi une image (photo) pour remplacer la pochette de l'album, ou tapez /cancel pour annuler.",
+                parse_mode="Markdown"
+            )
+            return WAITING_COVER
+        else:
+            ctx.user_data["edit_field"] = field
+            labels = {
+                "title": "le titre", "artist": "l'artiste", "album": "l'album",
+                "year": "l'année", "track": "le numéro de piste", "genre": "le genre"
+            }
+            await q.message.edit_text(
+                f"✍️ Envoyez le nouveau texte pour **{labels[field]}** :\n*(ou /cancel pour annuler)*",
+                parse_mode="Markdown"
+            )
+            return WAITING_TEXT
+
+    if data == "cancel":
+        _cleanup(ctx)
+        await q.message.edit_text("❌ Édition annulée.")
+        return ConversationHandler.END
+
+    if data == "save":
         fp = Path(ctx.user_data.get("edit_file", ""))
         if not fp.exists():
-            await q.message.reply_text("❌ Fichier introuvable.")
+            await q.message.edit_text("❌ Erreur : Fichier d'origine introuvable.")
             return ConversationHandler.END
-        tags = ctx.user_data["tags"]
-        write_tags(fp, **tags)
-        thumb = None
-        try:
-            T = MP3(str(fp), ID3=ID3).tags
-            for k, v in T.items():
-                if k.startswith("APIC"): thumb = v.data; break
-        except Exception: pass
+            
+        await q.message.edit_text("⏳ Application des modifications et envoi en cours...")
+        
+        # Apply tags
+        write_tags(fp, tags)
+        
+        # Send back
+        caption = f"🎵 *{tags['title']}*"
+        if tags['artist']: caption += f"\n🎤 {tags['artist']}"
+        if tags['album']:  caption += f"\n💿 {tags['album']}"
+        
         with open(fp, "rb") as f:
-            kw = dict(audio=f,
-                      caption=f"✅ `{tags['title']}` — `{tags['artist']}`",
-                      parse_mode="Markdown",
-                      title=tags["title"], performer=tags["artist"],
-                      read_timeout=60, write_timeout=60)
-            if thumb: kw["thumbnail"] = BytesIO(thumb)
+            kw = dict(
+                audio=f,
+                caption=caption,
+                parse_mode="Markdown",
+                title=tags["title"],
+                performer=tags["artist"],
+                read_timeout=120,
+                write_timeout=120
+            )
+            if tags["cover"]:
+                kw["thumbnail"] = BytesIO(tags["cover"])
+                
             await q.message.reply_audio(**kw)
+            
         _cleanup(ctx)
+        await q.message.delete()
         return ConversationHandler.END
 
-    return EDIT
+    return EDIT_MENU
 
-async def handle_text_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_text_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     field = ctx.user_data.get("edit_field")
-    if not field:
-        await update.message.reply_text("Clique sur un champ d'abord ☝️")
-        return EDIT
+    if not field: return EDIT_MENU
+    
     val = update.message.text.strip()
     ctx.user_data["tags"][field] = val
     ctx.user_data["edit_field"]  = None
+    
     tags = ctx.user_data["tags"]
-    await update.message.reply_text(
-        f"👍 `{val}`\n\n📝 `{tags['title']}`\n🎤 `{tags['artist']}`\n💿 `{tags['album']}`",
-        reply_markup=_tag_kb(tags), parse_mode="Markdown",
-    )
-    return EDIT
+    
+    # Try to delete user message to keep chat clean
+    try: await update.message.delete()
+    except Exception: pass
+    
+    msg_id = ctx.user_data.get("msg_id")
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=msg_id,
+            text=_get_menu_text(tags),
+            reply_markup=_tag_kb(tags),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        # Fallback if message is too old
+        m = await update.message.reply_text(
+            _get_menu_text(tags),
+            reply_markup=_tag_kb(tags),
+            parse_mode="Markdown"
+        )
+        ctx.user_data["msg_id"] = m.message_id
+        
+    return EDIT_MENU
+
+async def handle_cover_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo
+    document = update.message.document
+    
+    if not photo and not document:
+        await update.message.reply_text("❌ Veuillez envoyer une IMAGE (photo).")
+        return WAITING_COVER
+        
+    try:
+        if photo:
+            # Prend la meilleure qualité
+            file_id = photo[-1].file_id
+        elif document and document.mime_type.startswith("image/"):
+            file_id = document.file_id
+        else:
+            await update.message.reply_text("❌ Ce fichier n'est pas une image supportée.")
+            return WAITING_COVER
+            
+        tg_file = await ctx.bot.get_file(file_id)
+        
+        # Download image into memory
+        mem = BytesIO()
+        await tg_file.download_to_memory(mem)
+        img_bytes = mem.getvalue()
+        
+        ctx.user_data["tags"]["cover"] = img_bytes
+        
+        # Try to delete user message
+        try: await update.message.delete()
+        except Exception: pass
+        
+        tags = ctx.user_data["tags"]
+        msg_id = ctx.user_data.get("msg_id")
+        
+        await ctx.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=msg_id,
+            text=_get_menu_text(tags),
+            reply_markup=_tag_kb(tags),
+            parse_mode="Markdown"
+        )
+        return EDIT_MENU
+        
+    except Exception as e:
+        log.error("Image error: %s", e)
+        await update.message.reply_text("❌ Erreur lors du traitement de l'image.")
+        return EDIT_MENU
 
 def _cleanup(ctx):
     fp = ctx.user_data.get("edit_file")
@@ -700,20 +338,33 @@ def _cleanup(ctx):
         except Exception: pass
     ctx.user_data.clear()
 
-async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_cancel_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try: await update.message.delete()
+    except: pass
+    
+    tags = ctx.user_data.get("tags")
+    if tags:
+        msg_id = ctx.user_data.get("msg_id")
+        await ctx.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=msg_id,
+            text=_get_menu_text(tags),
+            reply_markup=_tag_kb(tags),
+            parse_mode="Markdown"
+        )
+    return EDIT_MENU
+
+async def cmd_cancel_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _cleanup(ctx)
-    await update.message.reply_text("❌ Annulé.")
+    await update.message.reply_text("❌ Édition annulée.")
     return ConversationHandler.END
 
 # ── MAIN ───────────────────────────────────────────────────────────
 def main():
-    import threading
-    threading.Thread(target=get_session, daemon=True).start()
-
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("set_arl", cmd_set_arl))
+    
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
 
     edit_conv = ConversationHandler(
         entry_points=[
@@ -721,17 +372,26 @@ def main():
             MessageHandler(filters.Document.MimeType("audio/mpeg") |
                            filters.Document.MimeType("audio/mp3"), handle_audio_file),
         ],
-        states={EDIT: [
-            CallbackQueryHandler(handle_btn),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_edit),
-        ]},
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        states={
+            EDIT_MENU: [
+                CallbackQueryHandler(handle_btn),
+            ],
+            WAITING_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input),
+                CommandHandler("cancel", cmd_cancel_edit),
+            ],
+            WAITING_COVER: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_cover_input),
+                CommandHandler("cancel", cmd_cancel_edit),
+            ]
+        },
+        fallbacks=[CommandHandler("stop", cmd_cancel_all)],
         per_message=False,
     )
+    
     app.add_handler(edit_conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-
-    log.info("🎵 MP3 Bot — prêt.")
+    
+    log.info("🎛 V3no Tag Editor UHQ — prêt.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
