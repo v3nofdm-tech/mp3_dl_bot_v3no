@@ -88,9 +88,11 @@ def write_tags(path: Path, tags: dict):
         keys_to_del = [k for k in T.keys() if k.startswith("APIC")]
         for k in keys_to_del: del T[k]
         
+        mime_type = "image/png" if tags["cover"].startswith(b'\x89PNG') else "image/jpeg"
+        
         T.add(APIC(
             encoding=0, # Latin1
-            mime="image/jpeg", # Supporte JPEG ou PNG selon le fichier
+            mime=mime_type,
             type=3, # 3 is for the cover(front)
             desc="Cover",
             data=tags["cover"]
@@ -99,6 +101,9 @@ def write_tags(path: Path, tags: dict):
     T.save(str(path), v2_version=3)
 
 # ── INTERFACE UTILISATEUR ──────────────────────────────────────────
+def _clean_filename(name: str) -> str:
+    import re
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 def _tag_kb(tags: dict) -> InlineKeyboardMarkup:
     has_cover = "✅ Oui" if tags.get("cover") else "❌ Non"
     
@@ -220,29 +225,44 @@ async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         await q.message.edit_text("⏳ Application des modifications et envoi en cours...")
         
-        # Apply tags
+        # Appliquer les tags
         write_tags(fp, tags)
         
-        # Send back
-        caption = f"🎵 *{tags['title']}*"
-        if tags['artist']: caption += f"\n🎤 {tags['artist']}"
-        if tags['album']:  caption += f"\n💿 {tags['album']}"
+        # Renommer proprement le fichier pour le rendu UHQ
+        t_title = tags.get("title", "").strip()
+        t_artist = tags.get("artist", "").strip()
+        if t_title and t_artist:
+            new_name = _clean_filename(f"{t_artist} - {t_title}.mp3")
+        elif t_title:
+            new_name = _clean_filename(f"{t_title}.mp3")
+        else:
+            new_name = "Track.mp3"
+            
+        new_fp = fp.with_name(new_name)
+        fp.rename(new_fp)
         
-        with open(fp, "rb") as f:
+        # Renvoyer le fichier
+        caption = f"🎵 *{t_title or 'Titre inconnu'}*"
+        if t_artist: caption += f"\n🎤 {t_artist}"
+        if tags.get("album"): caption += f"\n💿 {tags['album']}"
+        
+        with open(new_fp, "rb") as f:
             kw = dict(
                 audio=f,
                 caption=caption,
                 parse_mode="Markdown",
-                title=tags["title"],
-                performer=tags["artist"],
+                title=t_title,
+                performer=t_artist,
                 read_timeout=120,
                 write_timeout=120
             )
-            if tags["cover"]:
+            if tags.get("cover"):
                 kw["thumbnail"] = BytesIO(tags["cover"])
                 
             await q.message.reply_audio(**kw)
             
+        # Nettoyage
+        ctx.user_data["edit_file"] = str(new_fp)
         _cleanup(ctx)
         await q.message.delete()
         return ConversationHandler.END
