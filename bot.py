@@ -33,6 +33,13 @@ TMPDIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger("V3noTagger")
 
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+    log.info("ffmpeg prêt pour les conversions")
+except Exception as e:
+    log.warning("static-ffmpeg non dispo : %s", e)
+
 # ── ETATS DE LA CONVERSATION ────────────────────────────────────────
 EDIT_MENU = 0
 WAITING_TEXT = 1
@@ -142,33 +149,52 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_audio_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    audio = update.message.audio or update.message.document
-    if not audio: return ConversationHandler.END
+    # Accepter Audio, Document, Video, Voice
+    media = update.message.audio or update.message.document or update.message.video or update.message.voice
+    if not media: return ConversationHandler.END
     
-    fname = getattr(audio, "file_name", None) or "track.mp3"
-    if not (fname.lower().endswith(".mp3") or
-            getattr(audio, "mime_type", "") in ("audio/mpeg", "audio/mp3")):
-        await update.message.reply_text("❌ Veuillez envoyer un fichier *.mp3*", parse_mode="Markdown")
-        return ConversationHandler.END
-
+    fname = getattr(media, "file_name", None) or "track.mp3"
+    
     chat_id = str(update.effective_chat.id)
     edt_dir = TMPDIR / chat_id
     edt_dir.mkdir(parents=True, exist_ok=True)
     
-    msg = await update.message.reply_text("⏳ Chargement du fichier...")
+    msg = await update.message.reply_text("⏳ Téléchargement et préparation...")
     
-    tg_file = await audio.get_file()
+    tg_file = await media.get_file()
     
-    # Save with unique name to prevent collisions
     uid = __import__("uuid").uuid4().hex[:8]
-    local = edt_dir / f"{uid}_{fname}"
+    ext = Path(fname).suffix.lower()
+    if not ext: ext = ".mp4" if update.message.video else ".mp3"
+    
+    local = edt_dir / f"{uid}_in{ext}"
     await tg_file.download_to_drive(str(local))
     
-    tags = read_tags(local)
+    # Conversion si ce n'est pas un MP3
+    final_mp3 = edt_dir / f"{uid}_track.mp3"
+    if ext != ".mp3":
+        await msg.edit_text("⏳ Conversion en MP3 UHQ en cours...")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", str(local),
+            "-q:a", "0", "-map", "a", # Meilleure qualité VBR, extraire audio
+            str(final_mp3),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await proc.communicate()
+        try: local.unlink()
+        except: pass
+        if not final_mp3.exists():
+            await msg.edit_text("❌ Échec de la conversion audio.")
+            return ConversationHandler.END
+    else:
+        local.rename(final_mp3)
+    
+    tags = read_tags(final_mp3)
     
     ctx.user_data.clear()
     ctx.user_data.update(
-        edit_file=str(local),
+        edit_file=str(final_mp3),
         tags=tags,
         msg_id=msg.message_id
     )
@@ -388,9 +414,10 @@ def main():
 
     edit_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.AUDIO, handle_audio_file),
-            MessageHandler(filters.Document.MimeType("audio/mpeg") |
-                           filters.Document.MimeType("audio/mp3"), handle_audio_file),
+            MessageHandler(
+                filters.AUDIO | filters.VIDEO | filters.VOICE | filters.Document.ALL, 
+                handle_audio_file
+            ),
         ],
         states={
             EDIT_MENU: [
