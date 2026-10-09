@@ -405,12 +405,55 @@ async def cmd_cancel_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Édition annulée.")
     return ConversationHandler.END
 
+# ── MONITORING BEDRY ───────────────────────────────────────────────
+async def check_bedry_release(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    try:
+        import urllib.request, json
+        # ID 251970 is Bedry on Deezer
+        r = urllib.request.urlopen("https://api.deezer.com/artist/251970/albums").read()
+        data = json.loads(r).get("data", [])
+        
+        # Check if 'Beewaba' is in the latest albums
+        for album in data:
+            if "beewaba" in album.get("title", "").lower():
+                link = album.get("link", "")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🚨 **ALERTE DROP** 🚨\n\nBedry vient de drop l'album **Beewaba** !!!\n\nLien : {link}",
+                    parse_mode="Markdown"
+                )
+                # Stop the job once found
+                context.job.schedule_removal()
+                return
+    except Exception as e:
+        log.error("Erreur check_bedry: %s", e)
+
+async def cmd_beewaba(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    
+    # Check if job already exists
+    current_jobs = ctx.job_queue.get_jobs_by_name(f"beewaba_{chat_id}")
+    if current_jobs:
+        await update.message.reply_text("🚨 Le radar est DÉJÀ activé. Tu seras DM à la seconde du drop.")
+        return
+        
+    ctx.job_queue.run_repeating(
+        check_bedry_release, 
+        interval=10, 
+        first=1, 
+        chat_id=chat_id,
+        name=f"beewaba_{chat_id}"
+    )
+    await update.message.reply_text("🚨 **Radar activé !** Je check Deezer toutes les 10 secondes. Dès que Bedry drop *Beewaba*, je te DM instantanément.", parse_mode="Markdown")
+
 # ── MAIN ───────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("beewaba", cmd_beewaba))
 
     edit_conv = ConversationHandler(
         entry_points=[
