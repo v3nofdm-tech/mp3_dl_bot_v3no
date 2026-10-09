@@ -418,11 +418,16 @@ async def check_bedry_release(context: ContextTypes.DEFAULT_TYPE):
         for album in data:
             if "beewaba" in album.get("title", "").lower():
                 link = album.get("link", "")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🚨 **ALERTE DROP** 🚨\n\nBedry vient de drop l'album **Beewaba** !!!\n\nLien : {link}",
-                    parse_mode="Markdown"
-                )
+                
+                # Envoie 20 messages de suite pour réveiller le boss
+                for i in range(20):
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🚨 **ALERTE DROP** 🚨 ({i+1}/20)\n\nL'album **Beewaba** de Bedry est en ligne !!!\n\nLien Deezer (dispo Spotify en même temps) : {link}",
+                        parse_mode="Markdown"
+                    )
+                    await asyncio.sleep(1) # Petit délai pour pas se faire ban par l'API Telegram
+                    
                 # Stop the job once found
                 context.job.schedule_removal()
                 return
