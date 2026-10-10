@@ -161,50 +161,61 @@ async def handle_audio_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     msg = await update.message.reply_text("⏳ Téléchargement et préparation...")
     
-    tg_file = await media.get_file()
-    
-    uid = __import__("uuid").uuid4().hex[:8]
-    ext = Path(fname).suffix.lower()
-    if not ext: ext = ".mp4" if update.message.video else ".mp3"
-    
-    local = edt_dir / f"{uid}_in{ext}"
-    await tg_file.download_to_drive(str(local))
-    
-    # Conversion si ce n'est pas un MP3
-    final_mp3 = edt_dir / f"{uid}_track.mp3"
-    if ext != ".mp3":
-        await msg.edit_text("⏳ Conversion en MP3 UHQ en cours...")
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", str(local),
-            "-q:a", "0", "-map", "a", # Meilleure qualité VBR, extraire audio
-            str(final_mp3),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
+    try:
+        if getattr(media, "file_size", 0) > 20 * 1024 * 1024:
+            raise ValueError("Fichier trop volumineux (Telegram limite les bots à 20 Mo).")
+            
+        tg_file = await media.get_file()
+        
+        uid = __import__("uuid").uuid4().hex[:8]
+        ext = Path(fname).suffix.lower()
+        if not ext: ext = ".mp4" if update.message.video else ".mp3"
+        
+        local = edt_dir / f"{uid}_in{ext}"
+        await tg_file.download_to_drive(str(local))
+        
+        # Conversion si ce n'est pas un MP3
+        final_mp3 = edt_dir / f"{uid}_track.mp3"
+        if ext != ".mp3":
+            await msg.edit_text("⏳ Conversion en MP3 UHQ en cours (ça peut prendre quelques secondes)...")
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", str(local),
+                "-q:a", "0", "-map", "a", # Meilleure qualité VBR, extraire audio
+                str(final_mp3),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.communicate()
+            try: local.unlink()
+            except: pass
+            if not final_mp3.exists():
+                raise RuntimeError("Échec de la conversion audio avec ffmpeg.")
+        else:
+            local.rename(final_mp3)
+        
+        tags = read_tags(final_mp3)
+        
+        ctx.user_data.clear()
+        ctx.user_data.update(
+            edit_file=str(final_mp3),
+            tags=tags,
+            msg_id=msg.message_id
         )
-        await proc.communicate()
-        try: local.unlink()
-        except: pass
-        if not final_mp3.exists():
-            await msg.edit_text("❌ Échec de la conversion audio.")
-            return ConversationHandler.END
-    else:
-        local.rename(final_mp3)
-    
-    tags = read_tags(final_mp3)
-    
-    ctx.user_data.clear()
-    ctx.user_data.update(
-        edit_file=str(final_mp3),
-        tags=tags,
-        msg_id=msg.message_id
-    )
-    
-    await msg.edit_text(
-        _get_menu_text(tags),
-        reply_markup=_tag_kb(tags),
-        parse_mode="Markdown"
-    )
-    return EDIT_MENU
+        
+        await msg.edit_text(
+            _get_menu_text(tags),
+            reply_markup=_tag_kb(tags),
+            parse_mode="Markdown"
+        )
+        return EDIT_MENU
+        
+    except Exception as e:
+        log.error("handle_audio_file error: %s", e)
+        err_msg = str(e)
+        if "File is too big" in err_msg:
+            err_msg = "Le fichier dépasse 20 Mo (limite Telegram)."
+        await msg.edit_text(f"❌ Erreur : {err_msg}")
+        return ConversationHandler.END
 
 async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -405,61 +416,13 @@ async def cmd_cancel_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Édition annulée.")
     return ConversationHandler.END
 
-# ── MONITORING BEDRY ───────────────────────────────────────────────
-async def check_bedry_release(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    try:
-        import urllib.request, json
-        # ID 251970 is Bedry on Deezer
-        r = urllib.request.urlopen("https://api.deezer.com/artist/251970/albums").read()
-        data = json.loads(r).get("data", [])
-        
-        # Check if 'Beewaba' is in the latest albums
-        for album in data:
-            if "beewaba" in album.get("title", "").lower():
-                link = album.get("link", "")
-                
-                # Envoie 20 messages de suite pour réveiller le boss
-                for i in range(20):
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🚨 **ALERTE DROP** 🚨 ({i+1}/20)\n\nL'album **Beewaba** de Bedry est en ligne !!!\n\nLien Deezer (dispo Spotify en même temps) : {link}",
-                        parse_mode="Markdown"
-                    )
-                    await asyncio.sleep(1) # Petit délai pour pas se faire ban par l'API Telegram
-                    
-                # Stop the job once found
-                context.job.schedule_removal()
-                return
-    except Exception as e:
-        log.error("Erreur check_bedry: %s", e)
-
-async def cmd_beewaba(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    
-    # Check if job already exists
-    current_jobs = ctx.job_queue.get_jobs_by_name(f"beewaba_{chat_id}")
-    if current_jobs:
-        await update.message.reply_text("🚨 Le radar est DÉJÀ activé. Tu seras DM à la seconde du drop.")
-        return
-        
-    ctx.job_queue.run_repeating(
-        check_bedry_release, 
-        interval=10, 
-        first=1, 
-        chat_id=chat_id,
-        name=f"beewaba_{chat_id}"
-    )
-    await update.message.reply_text("🚨 **Radar activé !** Je check Deezer toutes les 10 secondes. Dès que Bedry drop *Beewaba*, je te DM instantanément.", parse_mode="Markdown")
-
 # ── MAIN ───────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("beewaba", cmd_beewaba))
-
+    
     edit_conv = ConversationHandler(
         entry_points=[
             MessageHandler(
