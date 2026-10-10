@@ -41,9 +41,10 @@ except Exception as e:
     log.warning("static-ffmpeg non dispo : %s", e)
 
 # ── ETATS DE LA CONVERSATION ────────────────────────────────────────
-EDIT_MENU = 0
+EDIT_MENU    = 0
 WAITING_TEXT = 1
 WAITING_COVER = 2
+WAITING_TRIM  = 3  # ✂️ en attente d'un timestamp type "0:15 - 2:30"
 
 # ── FONCTIONS TAGS ─────────────────────────────────────────────────
 def read_tags(path: Path) -> dict:
@@ -123,7 +124,8 @@ def _tag_kb(tags: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"🔢 Piste : {tags['track'] or '—'}", callback_data="set_track")
         ],
         [InlineKeyboardButton(f"🎸 Genre : {tags['genre'] or '—'}", callback_data="set_genre")],
-        [InlineKeyboardButton(f"🖼️ Cover (Image) : {has_cover}", callback_data="set_cover")],
+        [InlineKeyboardButton(f"🖼️ Cover : {has_cover}", callback_data="set_cover")],
+        [InlineKeyboardButton("✂️ Découper l'audio", callback_data="set_trim")],
         [
             InlineKeyboardButton("✅ Sauvegarder", callback_data="save"),
             InlineKeyboardButton("❌ Annuler", callback_data="cancel")
@@ -237,6 +239,29 @@ async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return WAITING_COVER
+        
+        elif field == "trim":
+            # Calculer la durée actuelle via mutagen
+            fp = Path(ctx.user_data.get("edit_file", ""))
+            duration_str = ""
+            if fp.exists():
+                try:
+                    from mutagen.mp3 import MP3 as _MP3
+                    dur = _MP3(str(fp)).info.length
+                    mins, secs = divmod(int(dur), 60)
+                    duration_str = f"\n\n⏱️ Durée actuelle : *{mins}:{secs:02d}*"
+                except Exception:
+                    pass
+            await q.message.edit_text(
+                f"✂️ *Découpage audio*{duration_str}\n\n"
+                "Envoie le timestamp de début et de fin, format :\n"
+                "`0:15 - 2:30`\n\n"
+                "Tu peux aussi juste couper la fin : `0:00 - 1:45`\n"
+                "*(ou /cancel pour revenir)*",
+                parse_mode="Markdown"
+            )
+            return WAITING_TRIM
+
         else:
             ctx.user_data["edit_field"] = field
             labels = {
@@ -388,6 +413,94 @@ async def handle_cover_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Erreur lors du traitement de l'image.")
         return EDIT_MENU
 
+async def handle_trim_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import re
+    text = update.message.text.strip()
+    try: await update.message.delete()
+    except: pass
+
+    # Parser le format "M:SS - M:SS" ou "MM:SS - MM:SS"
+    m = re.match(r"(\d+:\d{2})\s*[-–]\s*(\d+:\d{2})", text)
+    if not m:
+        await update.message.reply_text(
+            "❌ Format invalide. Utilise ce format :\n`0:15 - 2:30`",
+            parse_mode="Markdown"
+        )
+        return WAITING_TRIM
+
+    def ts_to_sec(ts: str) -> float:
+        parts = ts.split(":")
+        return int(parts[0]) * 60 + float(parts[1])
+
+    start_s = ts_to_sec(m.group(1))
+    end_s   = ts_to_sec(m.group(2))
+
+    if end_s <= start_s:
+        await update.message.reply_text("❌ La fin doit être après le début !")
+        return WAITING_TRIM
+
+    fp = Path(ctx.user_data.get("edit_file", ""))
+    if not fp.exists():
+        await update.message.reply_text("❌ Fichier introuvable, renvoyez-le.")
+        return ConversationHandler.END
+
+    msg_id = ctx.user_data.get("msg_id")
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=msg_id,
+            text=f"✂️ Découpage {m.group(1)} → {m.group(2)} en cours...",
+            parse_mode="Markdown"
+        )
+    except: pass
+
+    # Découpe avec ffmpeg — précision au sample près avec -ss avant -i
+    trimmed = fp.with_name(fp.stem + "_trimmed.mp3")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y",
+        "-ss", str(start_s),       # seek AVANT l'input = ultra précis + rapide
+        "-i", str(fp),
+        "-t", str(end_s - start_s),
+        "-q:a", "0",               # VBR best quality
+        "-map", "a",
+        # Copier les tags ID3 existants
+        "-id3v2_version", "3",
+        str(trimmed),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+    await proc.communicate()
+
+    if not trimmed.exists():
+        await update.message.reply_text("❌ Échec du découpage ffmpeg.")
+        return EDIT_MENU
+
+    # Remplacer le fichier source par le fichier découpé + maj tags
+    try: fp.unlink()
+    except: pass
+    trimmed.rename(fp)
+
+    # Re-lire les tags (les tags ID3 sont copiés par ffmpeg)
+    tags = read_tags(fp)
+    ctx.user_data["tags"] = tags
+    ctx.user_data["edit_file"] = str(fp)
+
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=msg_id,
+            text=_get_menu_text(tags),
+            reply_markup=_tag_kb(tags),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        m2 = await update.message.reply_text(
+            _get_menu_text(tags), reply_markup=_tag_kb(tags), parse_mode="Markdown"
+        )
+        ctx.user_data["msg_id"] = m2.message_id
+
+    return EDIT_MENU
+
 def _cleanup(ctx):
     fp = ctx.user_data.get("edit_file")
     if fp and Path(fp).exists():
@@ -440,6 +553,10 @@ def main():
             ],
             WAITING_COVER: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_cover_input),
+                CommandHandler("cancel", cmd_cancel_edit),
+            ],
+            WAITING_TRIM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_trim_input),
                 CommandHandler("cancel", cmd_cancel_edit),
             ]
         },
