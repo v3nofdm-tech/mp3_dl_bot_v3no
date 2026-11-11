@@ -31,6 +31,7 @@ TMPDIR    = Path(__import__("tempfile").gettempdir()) / "v3no_tagger"
 TMPDIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("V3noTagger")
 
 try:
@@ -156,8 +157,9 @@ async def handle_audio_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not media: return ConversationHandler.END
     
     fname = getattr(media, "file_name", None) or "track.mp3"
-    
     chat_id = str(update.effective_chat.id)
+    log.info("Fichier reçu de %s : %s", chat_id, fname)
+    _cleanup(ctx)
     edt_dir = TMPDIR / chat_id
     edt_dir.mkdir(parents=True, exist_ok=True)
     
@@ -561,6 +563,7 @@ def main():
             ]
         },
         fallbacks=[CommandHandler("stop", cmd_cancel_all)],
+        allow_reentry=True,
         per_message=False,
     )
     
