@@ -65,13 +65,9 @@ def read_tags(path: Path) -> dict:
             cover_bytes = v.data
             break
 
-    artist = s("TPE1").strip()
-    if artist.endswith("— V3no"):
-        artist = artist[:-6].strip()
-
     return {
         "title": s("TIT2") or path.stem,
-        "artist": artist,
+        "artist": s("TPE1"),
         "album": s("TALB"),
         "year": s("TDRC")[:4],
         "genre": s("TCON"),
@@ -293,28 +289,27 @@ async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         await q.message.edit_text("⏳ Application des modifications et envoi en cours...")
         
+        # Appliquer les tags (artiste principal uniquement, sans "— V3no")
+        write_tags(fp, tags)
+        
+        # Renommer proprement le fichier avec le tag "— V3no"
         t_title = tags.get("title", "").strip()
         t_artist = tags.get("artist", "").strip()
-        if t_artist.endswith("— V3no"):
-            t_artist = t_artist[:-6].strip()
-        final_artist = f"{t_artist} — V3no" if t_artist else "V3no"
-        
-        # Appliquer les tags (avec "— V3no" dans l'artiste ID3)
-        tags_to_save = {**tags, "artist": final_artist}
-        write_tags(fp, tags_to_save)
-        
-        # Renommer proprement le fichier pour le rendu UHQ
-        if t_title:
-            new_name = _clean_filename(f"{final_artist} - {t_title}.mp3")
+        if t_title and t_artist:
+            new_name = _clean_filename(f"{t_artist} — V3no - {t_title}.mp3")
+        elif t_title:
+            new_name = _clean_filename(f"V3no - {t_title}.mp3")
+        elif t_artist:
+            new_name = _clean_filename(f"{t_artist} — V3no.mp3")
         else:
-            new_name = _clean_filename(f"{final_artist}.mp3")
+            new_name = "V3no - Track.mp3"
             
         new_fp = fp.with_name(new_name)
         fp.rename(new_fp)
         
         # Renvoyer le fichier
         caption = f"🎵 *{t_title or 'Titre inconnu'}*"
-        caption += f"\n🎤 {final_artist}"
+        if t_artist: caption += f"\n🎤 {t_artist}"
         if tags.get("album"): caption += f"\n💿 {tags['album']}"
         
         with open(new_fp, "rb") as f:
@@ -324,7 +319,7 @@ async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 caption=caption,
                 parse_mode="Markdown",
                 title=t_title,
-                performer=final_artist,
+                performer=t_artist,
                 read_timeout=120,
                 write_timeout=120
             )
