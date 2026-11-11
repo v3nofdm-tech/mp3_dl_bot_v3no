@@ -290,24 +290,24 @@ async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text("⏳ Application des modifications et envoi en cours...")
         
         # Appliquer les tags (artiste principal uniquement, sans "— V3no")
-        write_tags(fp, tags)
-        
-        # Renommer proprement le fichier avec le tag "— V3no"
         t_title = tags.get("title", "").strip()
         t_artist = tags.get("artist", "").strip()
-        if t_title and t_artist:
-            new_name = _clean_filename(f"{t_artist} — V3no - {t_title}.mp3")
-        elif t_title:
-            new_name = _clean_filename(f"V3no - {t_title}.mp3")
-        elif t_artist:
-            new_name = _clean_filename(f"{t_artist} — V3no.mp3")
+        if t_artist.endswith("— V3no"):
+            t_artist = t_artist[:-6].strip()
+        performer_v3no = f"{t_artist} — V3no" if t_artist else "V3no"
+
+        write_tags(fp, {**tags, "artist": t_artist})
+        
+        # Renommer proprement le fichier avec le tag "— V3no"
+        if t_title:
+            new_name = _clean_filename(f"{performer_v3no} - {t_title}.mp3")
         else:
-            new_name = "V3no - Track.mp3"
+            new_name = _clean_filename(f"{performer_v3no}.mp3")
             
         new_fp = fp.with_name(new_name)
         fp.rename(new_fp)
         
-        # Renvoyer le fichier
+        # Renvoyer le fichier (description sans "— V3no", mais lecteur Telegram + nom de fichier avec "— V3no")
         caption = f"🎵 *{t_title or 'Titre inconnu'}*"
         if t_artist: caption += f"\n🎤 {t_artist}"
         if tags.get("album"): caption += f"\n💿 {tags['album']}"
@@ -319,7 +319,7 @@ async def handle_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 caption=caption,
                 parse_mode="Markdown",
                 title=t_title,
-                performer=t_artist,
+                performer=performer_v3no,
                 read_timeout=120,
                 write_timeout=120
             )
